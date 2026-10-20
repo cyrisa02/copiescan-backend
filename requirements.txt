@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+groq
+instructor
+pydantic
+python-dotenv
+python-multipart
+requests
+httpx
