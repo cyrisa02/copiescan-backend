@@ -1,4 +1,5 @@
 import os
+import asyncio
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -7,7 +8,6 @@ from groq import Groq
 import instructor
 from dotenv import load_dotenv
 import httpx
-import asyncio
 
 load_dotenv()
 
@@ -70,6 +70,14 @@ class CopyCorrectionRequest(BaseModel):
     consigne: str = Field(description="Consigne ou sujet")
     bareme: float = Field(description="Note maximale", default=20)
 
+class ChatMessage(BaseModel):
+    role: str = Field(description="user ou assistant")
+    content: str = Field(description="Contenu du message")
+
+class ChatCorrectionRequest(BaseModel):
+    messages: List[ChatMessage] = Field(description="Historique de la conversation")
+    correction_context: str = Field(description="La correction originale complète")
+
 # --- CLIENT GROQ ---
 client = instructor.from_groq(
     Groq(api_key=GROQ_API_KEY),
@@ -111,7 +119,7 @@ async def extract_invoice(request: ImageRequest, background_tasks: BackgroundTas
                     ]
                 }
             ],
-            max_tokens=800  # Réduit pour respecter la limite
+            max_tokens=800
         )
         
         background_tasks.add_task(send_to_google_sheets, extraction.model_dump())
@@ -123,9 +131,6 @@ async def extract_invoice(request: ImageRequest, background_tasks: BackgroundTas
 # --- ENDPOINT CORRECTION COPIES MULTI-PAGES ---
 @app.post("/correct-copy")
 async def correct_copy(request: CopyCorrectionRequest):
-    """
-    Corrige une copie multi-pages avec respect des limites Groq (1000 tokens/min).
-    """
     try:
         print(f"[CORRECTION] Réception de {len(request.images_base64)} page(s)")
         
@@ -144,7 +149,6 @@ async def correct_copy(request: CopyCorrectionRequest):
             - erreurs: max 3 erreurs
             - points_forts: max 2"""
             
-            # Analyse page - max 700 tokens pour rester sous la limite
             page_analysis = client.chat.completions.create(
                 model="qwen/qwen3.8-27b",
                 response_model=PageAnalysis,
@@ -158,19 +162,17 @@ async def correct_copy(request: CopyCorrectionRequest):
                         ]
                     }
                 ],
-                max_tokens=700  # ⚠️ CLÉ : sous la limite de 1000
+                max_tokens=700
             )
             pages_analyses.append(page_analysis)
             print(f"[CORRECTION] Page {idx + 1} analysée")
             
-            # Délai pour respecter la limite OTPM (1000 tokens/min)
             if idx < len(request.images_base64) - 1:
                 print("[CORRECTION] Pause 5s (limite Groq)...")
                 await asyncio.sleep(5)
         
         print("[CORRECTION] Synthèse finale...")
         
-        # Construction du prompt de synthèse (texte uniquement, pas d'images)
         synthesis_parts = [f"Sujet: {request.consigne}\nBarème: {request.bareme}/20\n"]
         
         for idx, analysis in enumerate(pages_analyses):
@@ -186,7 +188,6 @@ async def correct_copy(request: CopyCorrectionRequest):
         Fournis une évaluation complète basée sur les analyses de pages.
         Sois concis et précis."""
         
-        # Synthèse finale - max 900 tokens
         correction = client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             response_model=CorrectionResult,
@@ -194,7 +195,7 @@ async def correct_copy(request: CopyCorrectionRequest):
                 {"role": "system", "content": system_prompt_final},
                 {"role": "user", "content": synthesis_text}
             ],
-            max_tokens=900  # ⚠️ Sous la limite de 1000
+            max_tokens=900
         )
         
         print("[CORRECTION] Terminée avec succès")
@@ -203,3 +204,37 @@ async def correct_copy(request: CopyCorrectionRequest):
     except Exception as e:
         print(f"[CORRECTION] Erreur: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+# --- ENDPOINT CHAT CORRECTION ---
+@app.post("/chat-correction")
+async def chat_correction(request: ChatCorrectionRequest):
+    try:
+        print(f"[CHAT] Nouveau message, historique: {len(request.messages)} messages")
+        
+        system_prompt = f"""Tu es un professeur de Lettres Modernes bienveillant.
+Tu viens de corriger cette copie avec l'évaluation suivante :
+
+{request.correction_context}
+
+Tu réponds aux questions sur cette correction. Tes réponses doivent être :
+- Concises (max 100 mots)
+- Pédagogiques et encourageantes
+- Basées strictement sur la correction fournie
+- En français"""
+
+        api_messages = [{"role": "system", "content": system_prompt}]
+        
+        for msg in request.messages:
+            api_messages.append({"role": msg.role, "content": msg.content})
+        
+        response = client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=api_messages,
+            max_tokens=400
+        )
+        
+        return {"response": response.choices[0].message.content}
+        
+    except Exception as e:
+        print(f"[CHAT] Erreur: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
