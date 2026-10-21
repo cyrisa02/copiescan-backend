@@ -118,66 +118,67 @@ async def extract_invoice(request: ImageRequest, background_tasks: BackgroundTas
 @app.post("/correct-copy")
 async def correct_copy(request: CopyCorrectionRequest):
     """
-    Corrige une copie de français (dissertation/commentaire) sur plusieurs pages.
-    RGPD: Aucune donnée n'est stockée. Traitement à la volée uniquement.
+    Corrige une copie de français multi-pages en traitant chaque page séparément.
     """
     try:
-        # Construit les URLs pour toutes les images
-        images_data_uri = []
-        for img_base64 in request.images_base64:
+        # Traite chaque image individuellement
+        pages_analyses = []
+        for idx, img_base64 in enumerate(request.images_base64):
             if "," in img_base64:
                 img_base64 = img_base64.split(",")[1]
-            images_data_uri.append(f"data:image/jpeg;base64,{img_base64}")
+            image_data_uri = f"data:image/jpeg;base64,{img_base64}"
+            
+            system_prompt = """Tu es un professeur de Lettres Modernes expérimenté.
+            Analyse cette page de copie et extrais :
+            1. Le contenu textuel principal
+            2. Les erreurs évidentes (orthographe, syntaxe, structure)
+            3. Les points forts observés
+            
+            Réponds en JSON avec : {"contenu": "...", "erreurs_page": [...], "points_forts_page": [...]}"""
+            
+            # Analyse de la page
+            page_analysis = client.chat.completions.create(
+                model="qwen/qwen3.8-27b",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"Page {idx + 1} sur {len(request.images_base64)}"},
+                            {"type": "image_url", "image_url": {"url": image_data_uri}}
+                        ]
+                    }
+                ],
+                max_tokens=1500
+            )
+            pages_analyses.append(page_analysis.choices[0].message.content)
         
-        system_prompt = """Tu es un professeur de Lettres Modernes expérimenté, correcteur au Baccalauréat.
-Ta mission est de corriger une copie de français (dissertation ou commentaire composé) qui peut faire plusieurs pages.
-
-Critères d'évaluation stricts :
-1. Respect du sujet : L'élève a-t-il répondu à la problématique ? Y a-t-il des hors-sujets ?
-2. Structure : La copie suit-elle le plan attendu (Intro claire, Développement en parties/sous-parties, Conclusion bilans) ?
-3. Argumentation : Les idées sont-elles étayées par des exemples littéraires précis ?
-4. Expression : Qualité de la langue, richesse du vocabulaire, absence de fautes d'orthographe/grammaire.
-
-Ton ton doit être :
-- Exigeant sur la méthode (plan, citations).
-- Bienveillant sur le fond (valoriser les efforts d'analyse).
-- Constructif (donner des pistes concrètes pour améliorer la note).
-
-Si la copie est illisible ou trop courte, signale-le immédiatement."""
-
-        # Construit le contenu utilisateur avec TOUTES les images
-        user_content = [
-            {
-                "type": "text", 
-                "text": f"Corrige cette copie de {len(request.images_base64)} page(s).\n\nSujet/Consigne: {request.consigne}\nBarème: {request.bareme}/20\n\nAnalyse l'ensemble de la copie et fournis une évaluation complète."
-            }
-        ]
+        # Fusionne toutes les analyses en une correction finale
+        system_prompt_final = """Tu es un professeur de Lettres Modernes, correcteur au Baccalauréat.
+        À partir des analyses de chaque page ci-dessous, fournis une évaluation complète.
         
-        # Ajoute chaque image au contenu
-        for img_uri in images_data_uri:
-            user_content.append({
-                "type": "image_url", 
-                "image_url": {"url": img_uri}
-            })
-
+        Critères :
+        1. Respect du sujet et problématique
+        2. Structure (intro, développement, conclusion)
+        3. Argumentation et exemples littéraires
+        4. Expression et qualité de la langue"""
+        
+        # Construit le prompt de synthèse
+        synthesis_text = f"Sujet: {request.consigne}\nBarème: {request.bareme}/20\n\n"
+        for idx, analysis in enumerate(pages_analyses):
+            synthesis_text += f"=== PAGE {idx + 1} ===\n{analysis}\n\n"
+        
         correction = client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             response_model=CorrectionResult,
             messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": user_content
-                }
+                {"role": "system", "content": system_prompt_final},
+                {"role": "user", "content": synthesis_text}
             ],
             max_tokens=3000
         )
         
-        # PAS de stockage - RGPD compliant
         return correction
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la correction: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
