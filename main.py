@@ -119,18 +119,23 @@ async def extract_invoice(request: ImageRequest, background_tasks: BackgroundTas
 async def correct_copy(request: CopyCorrectionRequest):
     """
     Corrige une copie de français multi-pages en traitant chaque page séparément.
+    RGPD: Aucune donnée n'est stockée.
     """
     try:
-        # Traite chaque image individuellement
+        print(f"[CORRECTION] Réception de {len(request.images_base64)} page(s)")
+        
+        # Traite chaque image individuellement pour éviter les bugs multi-images de Qwen
         pages_analyses = []
         for idx, img_base64 in enumerate(request.images_base64):
+            print(f"[CORRECTION] Traitement page {idx + 1}/{len(request.images_base64)}")
+            
             if "," in img_base64:
                 img_base64 = img_base64.split(",")[1]
             image_data_uri = f"data:image/jpeg;base64,{img_base64}"
             
             system_prompt = """Tu es un professeur de Lettres Modernes expérimenté.
             Analyse cette page de copie et extrais :
-            1. Le contenu textuel principal
+            1. Le contenu textuel principal (transcription)
             2. Les erreurs évidentes (orthographe, syntaxe, structure)
             3. Les points forts observés
             
@@ -152,6 +157,9 @@ async def correct_copy(request: CopyCorrectionRequest):
                 max_tokens=1500
             )
             pages_analyses.append(page_analysis.choices[0].message.content)
+            print(f"[CORRECTION] Page {idx + 1} analysée")
+        
+        print("[CORRECTION] Synthèse finale...")
         
         # Fusionne toutes les analyses en une correction finale
         system_prompt_final = """Tu es un professeur de Lettres Modernes, correcteur au Baccalauréat.
@@ -178,7 +186,9 @@ async def correct_copy(request: CopyCorrectionRequest):
             max_tokens=3000
         )
         
+        print("[CORRECTION] Terminée avec succès")
         return correction
         
     except Exception as e:
+        print(f"[CORRECTION] Erreur: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
