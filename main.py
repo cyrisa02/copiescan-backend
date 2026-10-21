@@ -39,6 +39,12 @@ class ExtractionFacture(BaseModel):
     lignes: Optional[List[dict]] = None
 
 # --- SCHÉMAS PYDANTIC CORRECTION FRANÇAIS ---
+class PageAnalysis(BaseModel):
+    """Schéma pour l'analyse intermédiaire d'une page"""
+    contenu: str = Field(description="Transcription du contenu principal de la page")
+    erreurs_page: List[str] = Field(description="Liste des erreurs évidentes sur cette page")
+    points_forts_page: List[str] = Field(description="Liste des points forts sur cette page")
+
 class ErreurIdentifiee(BaseModel):
     type_erreur: str = Field(description="Type: Orthographe, Syntaxe, Contre-sens, Hors-sujet, Structure")
     citation: Optional[str] = Field(description="Extrait de la copie concernée", default=None)
@@ -124,7 +130,7 @@ async def correct_copy(request: CopyCorrectionRequest):
     try:
         print(f"[CORRECTION] Réception de {len(request.images_base64)} page(s)")
         
-        # Traite chaque image individuellement pour éviter les bugs multi-images de Qwen
+        # Traite chaque image individuellement
         pages_analyses = []
         for idx, img_base64 in enumerate(request.images_base64):
             print(f"[CORRECTION] Traitement page {idx + 1}/{len(request.images_base64)}")
@@ -137,13 +143,12 @@ async def correct_copy(request: CopyCorrectionRequest):
             Analyse cette page de copie et extrais :
             1. Le contenu textuel principal (transcription)
             2. Les erreurs évidentes (orthographe, syntaxe, structure)
-            3. Les points forts observés
+            3. Les points forts observés"""
             
-            Réponds en JSON avec : {"contenu": "...", "erreurs_page": [...], "points_forts_page": [...]}"""
-            
-            # Analyse de la page
+            # Analyse de la page AVEC response_model (obligatoire avec instructor)
             page_analysis = client.chat.completions.create(
                 model="qwen/qwen3.8-27b",
+                response_model=PageAnalysis,  # <-- C'était ça le bug !
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {
@@ -156,7 +161,7 @@ async def correct_copy(request: CopyCorrectionRequest):
                 ],
                 max_tokens=1500
             )
-            pages_analyses.append(page_analysis.choices[0].message.content)
+            pages_analyses.append(page_analysis)
             print(f"[CORRECTION] Page {idx + 1} analysée")
         
         print("[CORRECTION] Synthèse finale...")
@@ -174,7 +179,10 @@ async def correct_copy(request: CopyCorrectionRequest):
         # Construit le prompt de synthèse
         synthesis_text = f"Sujet: {request.consigne}\nBarème: {request.bareme}/20\n\n"
         for idx, analysis in enumerate(pages_analyses):
-            synthesis_text += f"=== PAGE {idx + 1} ===\n{analysis}\n\n"
+            synthesis_text += f"=== PAGE {idx + 1} ===\n"
+            synthesis_text += f"Contenu: {analysis.contenu}\n"
+            synthesis_text += f"Erreurs: {', '.join(analysis.erreurs_page)}\n"
+            synthesis_text += f"Points forts: {', '.join(analysis.points_forts_page)}\n\n"
         
         correction = client.chat.completions.create(
             model="qwen/qwen3.8-27b",
