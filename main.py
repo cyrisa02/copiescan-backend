@@ -28,8 +28,7 @@ GOOGLE_APPS_SCRIPT_URL = os.getenv("GOOGLE_APPS_SCRIPT_URL")
 if not GROQ_API_KEY or not GOOGLE_APPS_SCRIPT_URL:
     raise ValueError("Variables d'environnement GROQ_API_KEY ou GOOGLE_APPS_SCRIPT_URL manquantes")
 
-# --- SCHÉMAS PYDANTIC ---
-
+# --- SCHÉMAS PYDANTIC FACTURE ---
 class ExtractionFacture(BaseModel):
     date: str = Field(description="Format YYYY-MM-DD")
     fournisseur: str
@@ -39,6 +38,7 @@ class ExtractionFacture(BaseModel):
     numero_facture: Optional[str] = None
     lignes: Optional[List[dict]] = None
 
+# --- SCHÉMAS PYDANTIC CORRECTION FRANÇAIS ---
 class ErreurIdentifiee(BaseModel):
     type_erreur: str = Field(description="Type: Orthographe, Syntaxe, Contre-sens, Hors-sujet, Structure")
     citation: Optional[str] = Field(description="Extrait de la copie concernée", default=None)
@@ -53,11 +53,12 @@ class CorrectionResult(BaseModel):
     erreurs_details: List[ErreurIdentifiee] = Field(description="Analyse détaillée des faiblesses")
     structure_evaluee: str = Field(description="Évaluation de la structure (intro, développement, conclusion)")
 
+# --- SCHÉMAS DE REQUÊTE ---
 class ImageRequest(BaseModel):
     image_base64: str
 
 class CopyCorrectionRequest(BaseModel):
-    image_base64: str
+    images_base64: List[str] = Field(description="Liste des images Base64 (multi-pages)")
     matiere: str = Field(description="Matière scolaire", default="Français")
     consigne: str = Field(description="Consigne ou sujet de la dissertation/commentaire")
     bareme: float = Field(description="Note maximale possible", default=20)
@@ -82,6 +83,7 @@ async def send_to_google_sheets(payload: dict):
     except Exception as e:
         print(f"[SHEETS] Erreur critique: {e}")
 
+# --- ENDPOINT FACTURE ---
 @app.post("/extract")
 async def extract_invoice(request: ImageRequest, background_tasks: BackgroundTasks):
     try:
@@ -91,7 +93,6 @@ async def extract_invoice(request: ImageRequest, background_tasks: BackgroundTas
         
         image_data_uri = f"data:image/jpeg;base64,{image_base64}"
         
-        # Extraction IA
         extraction = client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             response_model=ExtractionFacture,
@@ -107,29 +108,29 @@ async def extract_invoice(request: ImageRequest, background_tasks: BackgroundTas
             max_tokens=1000
         )
         
-        # Envoi AUTOMATIQUE vers le sheet (non bloquant)
         background_tasks.add_task(send_to_google_sheets, extraction.model_dump())
-        
         return extraction
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- ENDPOINT CORRECTION COPIES MULTI-PAGES ---
 @app.post("/correct-copy")
 async def correct_copy(request: CopyCorrectionRequest):
     """
-    Corrige une copie de français (dissertation/commentaire).
+    Corrige une copie de français (dissertation/commentaire) sur plusieurs pages.
     RGPD: Aucune donnée n'est stockée. Traitement à la volée uniquement.
     """
     try:
-        image_base64 = request.image_base64
-        if "," in image_base64:
-            image_base64 = image_base64.split(",")[1]
-        
-        image_data_uri = f"data:image/jpeg;base64,{image_base64}"
+        # Construit les URLs pour toutes les images
+        images_data_uri = []
+        for img_base64 in request.images_base64:
+            if "," in img_base64:
+                img_base64 = img_base64.split(",")[1]
+            images_data_uri.append(f"data:image/jpeg;base64,{img_base64}")
         
         system_prompt = """Tu es un professeur de Lettres Modernes expérimenté, correcteur au Baccalauréat.
-Ta mission est de corriger une copie de français (dissertation ou commentaire composé).
+Ta mission est de corriger une copie de français (dissertation ou commentaire composé) qui peut faire plusieurs pages.
 
 Critères d'évaluation stricts :
 1. Respect du sujet : L'élève a-t-il répondu à la problématique ? Y a-t-il des hors-sujets ?
@@ -144,7 +145,21 @@ Ton ton doit être :
 
 Si la copie est illisible ou trop courte, signale-le immédiatement."""
 
-        # Correction IA
+        # Construit le contenu utilisateur avec TOUTES les images
+        user_content = [
+            {
+                "type": "text", 
+                "text": f"Corrige cette copie de {len(request.images_base64)} page(s).\n\nSujet/Consigne: {request.consigne}\nBarème: {request.bareme}/20\n\nAnalyse l'ensemble de la copie et fournis une évaluation complète."
+            }
+        ]
+        
+        # Ajoute chaque image au contenu
+        for img_uri in images_data_uri:
+            user_content.append({
+                "type": "image_url", 
+                "image_url": {"url": img_uri}
+            })
+
         correction = client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             response_model=CorrectionResult,
@@ -155,19 +170,10 @@ Si la copie est illisible ou trop courte, signale-le immédiatement."""
                 },
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "text", 
-                            "text": f"Corrige cette copie.\n\nSujet/Consigne: {request.consigne}\nBarème: {request.bareme}/20\n\nAnalyse la copie et fournis une évaluation complète."
-                        },
-                        {
-                            "type": "image_url", 
-                            "image_url": {"url": image_data_uri}
-                        }
-                    ]
+                    "content": user_content
                 }
             ],
-            max_tokens=2500
+            max_tokens=3000
         )
         
         # PAS de stockage - RGPD compliant
