@@ -7,6 +7,7 @@ from groq import Groq
 import instructor
 from dotenv import load_dotenv
 import httpx
+import asyncio
 
 load_dotenv()
 
@@ -40,24 +41,24 @@ class ExtractionFacture(BaseModel):
 
 # --- SCHÉMAS PYDANTIC CORRECTION FRANÇAIS ---
 class PageAnalysis(BaseModel):
-    """Schéma pour l'analyse intermédiaire d'une page"""
-    contenu: str = Field(description="Transcription du contenu principal de la page")
-    erreurs_page: List[str] = Field(description="Liste des erreurs évidentes sur cette page")
-    points_forts_page: List[str] = Field(description="Liste des points forts sur cette page")
+    """Schéma compact pour l'analyse d'une page"""
+    contenu: str = Field(description="Résumé du contenu (50 mots max)")
+    erreurs: List[str] = Field(description="Max 3 erreurs principales")
+    points_forts: List[str] = Field(description="Max 2 points forts")
 
 class ErreurIdentifiee(BaseModel):
     type_erreur: str = Field(description="Type: Orthographe, Syntaxe, Contre-sens, Hors-sujet, Structure")
-    citation: Optional[str] = Field(description="Extrait de la copie concernée", default=None)
-    explication: str = Field(description="Pourquoi c'est une erreur ou une faiblesse")
-    suggestion: str = Field(description="Comment reformuler ou améliorer")
+    citation: Optional[str] = Field(description="Extrait de la copie", default=None)
+    explication: str = Field(description="Pourquoi c'est une erreur")
+    suggestion: str = Field(description="Comment corriger")
 
 class CorrectionResult(BaseModel):
     note: float = Field(description="Note sur 20")
-    appreciation_generale: str = Field(description="Appréciation globale style bulletin scolaire")
-    points_forts: List[str] = Field(description="Qualités rédactionnelles et analytiques")
-    axes_amelioration: List[str] = Field(description="Conseils précis pour monter en niveau")
-    erreurs_details: List[ErreurIdentifiee] = Field(description="Analyse détaillée des faiblesses")
-    structure_evaluee: str = Field(description="Évaluation de la structure (intro, développement, conclusion)")
+    appreciation_generale: str = Field(description="Appréciation globale (2 phrases max)")
+    points_forts: List[str] = Field(description="3 points forts max")
+    axes_amelioration: List[str] = Field(description="3 axes d'amélioration max")
+    erreurs_details: List[ErreurIdentifiee] = Field(description="Erreurs principales")
+    structure_evaluee: str = Field(description="Évaluation structure (1 phrase)")
 
 # --- SCHÉMAS DE REQUÊTE ---
 class ImageRequest(BaseModel):
@@ -66,8 +67,8 @@ class ImageRequest(BaseModel):
 class CopyCorrectionRequest(BaseModel):
     images_base64: List[str] = Field(description="Liste des images Base64 (multi-pages)")
     matiere: str = Field(description="Matière scolaire", default="Français")
-    consigne: str = Field(description="Consigne ou sujet de la dissertation/commentaire")
-    bareme: float = Field(description="Note maximale possible", default=20)
+    consigne: str = Field(description="Consigne ou sujet")
+    bareme: float = Field(description="Note maximale", default=20)
 
 # --- CLIENT GROQ ---
 client = instructor.from_groq(
@@ -77,7 +78,6 @@ client = instructor.from_groq(
 
 # --- FONCTION WEBHOOK ASYNCHRONE ---
 async def send_to_google_sheets(payload: dict):
-    """Envoie les données vers le Sheet configuré en arrière-plan"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as http_client:
             response = await http_client.post(
@@ -106,12 +106,12 @@ async def extract_invoice(request: ImageRequest, background_tasks: BackgroundTas
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Extrais les données de cette facture. Retourne null si illisible."},
+                        {"type": "text", "text": "Extrais les données de cette facture."},
                         {"type": "image_url", "image_url": {"url": image_data_uri}}
                     ]
                 }
             ],
-            max_tokens=1000
+            max_tokens=800  # Réduit pour respecter la limite
         )
         
         background_tasks.add_task(send_to_google_sheets, extraction.model_dump())
@@ -124,14 +124,13 @@ async def extract_invoice(request: ImageRequest, background_tasks: BackgroundTas
 @app.post("/correct-copy")
 async def correct_copy(request: CopyCorrectionRequest):
     """
-    Corrige une copie de français multi-pages en traitant chaque page séparément.
-    RGPD: Aucune donnée n'est stockée.
+    Corrige une copie multi-pages avec respect des limites Groq (1000 tokens/min).
     """
     try:
         print(f"[CORRECTION] Réception de {len(request.images_base64)} page(s)")
         
-        # Traite chaque image individuellement
         pages_analyses = []
+        
         for idx, img_base64 in enumerate(request.images_base64):
             print(f"[CORRECTION] Traitement page {idx + 1}/{len(request.images_base64)}")
             
@@ -139,51 +138,55 @@ async def correct_copy(request: CopyCorrectionRequest):
                 img_base64 = img_base64.split(",")[1]
             image_data_uri = f"data:image/jpeg;base64,{img_base64}"
             
-            system_prompt = """Tu es un professeur de Lettres Modernes expérimenté.
-            Analyse cette page de copie et extrais :
-            1. Le contenu textuel principal (transcription)
-            2. Les erreurs évidentes (orthographe, syntaxe, structure)
-            3. Les points forts observés"""
+            system_prompt = """Prof de français. Analyse cette page.
+            Réponds en JSON compact avec :
+            - contenu: résumé 50 mots
+            - erreurs: max 3 erreurs
+            - points_forts: max 2"""
             
-            # Analyse de la page AVEC response_model (obligatoire avec instructor)
+            # Analyse page - max 700 tokens pour rester sous la limite
             page_analysis = client.chat.completions.create(
                 model="qwen/qwen3.8-27b",
-                response_model=PageAnalysis,  # <-- C'était ça le bug !
+                response_model=PageAnalysis,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": f"Page {idx + 1} sur {len(request.images_base64)}"},
+                            {"type": "text", "text": f"Page {idx + 1}"},
                             {"type": "image_url", "image_url": {"url": image_data_uri}}
                         ]
                     }
                 ],
-                max_tokens=1500
+                max_tokens=700  # ⚠️ CLÉ : sous la limite de 1000
             )
             pages_analyses.append(page_analysis)
             print(f"[CORRECTION] Page {idx + 1} analysée")
+            
+            # Délai pour respecter la limite OTPM (1000 tokens/min)
+            if idx < len(request.images_base64) - 1:
+                print("[CORRECTION] Pause 5s (limite Groq)...")
+                await asyncio.sleep(5)
         
         print("[CORRECTION] Synthèse finale...")
         
-        # Fusionne toutes les analyses en une correction finale
-        system_prompt_final = """Tu es un professeur de Lettres Modernes, correcteur au Baccalauréat.
-        À partir des analyses de chaque page ci-dessous, fournis une évaluation complète.
+        # Construction du prompt de synthèse (texte uniquement, pas d'images)
+        synthesis_parts = [f"Sujet: {request.consigne}\nBarème: {request.bareme}/20\n"]
         
-        Critères :
-        1. Respect du sujet et problématique
-        2. Structure (intro, développement, conclusion)
-        3. Argumentation et exemples littéraires
-        4. Expression et qualité de la langue"""
-        
-        # Construit le prompt de synthèse
-        synthesis_text = f"Sujet: {request.consigne}\nBarème: {request.bareme}/20\n\n"
         for idx, analysis in enumerate(pages_analyses):
-            synthesis_text += f"=== PAGE {idx + 1} ===\n"
-            synthesis_text += f"Contenu: {analysis.contenu}\n"
-            synthesis_text += f"Erreurs: {', '.join(analysis.erreurs_page)}\n"
-            synthesis_text += f"Points forts: {', '.join(analysis.points_forts_page)}\n\n"
+            synthesis_parts.append(f"=== PAGE {idx + 1} ===")
+            synthesis_parts.append(f"Contenu: {analysis.contenu}")
+            synthesis_parts.append(f"Erreurs: {'; '.join(analysis.erreurs)}")
+            synthesis_parts.append(f"Points forts: {'; '.join(analysis.points_forts)}")
+            synthesis_parts.append("")
         
+        synthesis_text = "\n".join(synthesis_parts)
+        
+        system_prompt_final = """Prof de français, correcteur Bac.
+        Fournis une évaluation complète basée sur les analyses de pages.
+        Sois concis et précis."""
+        
+        # Synthèse finale - max 900 tokens
         correction = client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             response_model=CorrectionResult,
@@ -191,7 +194,7 @@ async def correct_copy(request: CopyCorrectionRequest):
                 {"role": "system", "content": system_prompt_final},
                 {"role": "user", "content": synthesis_text}
             ],
-            max_tokens=3000
+            max_tokens=900  # ⚠️ Sous la limite de 1000
         )
         
         print("[CORRECTION] Terminée avec succès")
